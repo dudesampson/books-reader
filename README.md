@@ -65,6 +65,18 @@ Page text and generated audio are temporarily written under the macOS temporary 
 
 No books, recordings, personal coursework, compiled apps, or development archives are included in this repository. See [SECURITY.md](SECURITY.md) for reporting guidance.
 
+This project has not undergone an independent security audit. AI assistance was used during development; reading does not send your book text to an AI service.
+
+## Content and voice permissions
+
+The MIT license covers this project's code. It does not grant rights to book content, Apple's software, or Apple's system voices. Use only content you are authorized to process, and follow the terms that apply to your content and macOS version.
+
+[Apple's Media Services terms, section F](https://www.apple.com/legal/internet-services/itunes/us/terms.html) restrict automated scraping and copying of service content. How those restrictions apply to this Accessibility-based reading workflow has not been legally reviewed. Accessibility access and the absence of DRM circumvention do not establish permission for every use with purchased books.
+
+[The macOS Tahoe license, section 2F](https://www.apple.com/legal/sla/docs/macOSTahoe.pdf) restricts system-voice use, including public sharing and commercial contexts. Do not assume generated narration can be published or sold. For a public demonstration, use your own sample text and a silent recording or your own spoken narration, rather than including the app's generated audio.
+
+This is an experimental reading companion, not a service for creating or distributing audiobooks. These notes identify limitations; they are not legal clearance.
+
 ## Limitations
 
 The reader uses the text Apple Books exposes through Accessibility. Image-only pages, some PDFs, and some book layouts may not work. It does not extract protected book files or bypass DRM. A visible two-page spread is treated as one reading unit.
