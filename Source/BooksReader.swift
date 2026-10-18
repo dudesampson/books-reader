@@ -3,6 +3,13 @@ import AVFoundation
 import ApplicationServices
 import MediaPlayer
 
+let playbackRates: [Float] = [0.75, 0.85, 1, 1.25, 1.5, 2]
+func restoredPlaybackRate(savedRate: Float?, legacyIndex: Int) -> Float {
+    if let savedRate = savedRate, playbackRates.contains(savedRate) { return savedRate }
+    let legacyRates: [Float] = [1, 1.25, 1.5, 2]
+    return legacyRates[min(max(legacyIndex, 0), legacyRates.count - 1)]
+}
+
 // Short first segment starts playback quickly; remaining segments are generated ahead.
 func segments(_ text: String) -> [String] {
     let sentences = text.components(separatedBy: .newlines).flatMap { paragraph -> [String] in
@@ -174,8 +181,10 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         navigation.addArrangedSubview(previousButton); navigation.addArrangedSubview(reread); navigation.addArrangedSubview(nextButton); stack.addArrangedSubview(navigation)
         let settings = NSStackView(); settings.spacing = 10
         settings.addArrangedSubview(label("Speed", size: 12))
-        speed.addItems(withTitles: ["1×", "1.25×", "1.5×", "2×"]); speed.target = self; speed.action = #selector(changeSpeed)
-        let saved = UserDefaults.standard.integer(forKey: "speedIndex"); speed.selectItem(at: min(max(saved, 0), 3)); rate = [1, 1.25, 1.5, 2][speed.indexOfSelectedItem]
+        speed.addItems(withTitles: playbackRates.map { String(format: "%g×", Double($0)) }); speed.target = self; speed.action = #selector(changeSpeed)
+        let preferences = UserDefaults.standard
+        rate = restoredPlaybackRate(savedRate: (preferences.object(forKey: "playbackRate") as? NSNumber)?.floatValue, legacyIndex: preferences.integer(forKey: "speedIndex"))
+        speed.selectItem(at: playbackRates.firstIndex(of: rate)!)
         settings.addArrangedSubview(speed); settings.addArrangedSubview(NSView()); auto.state = .on; auto.font = .systemFont(ofSize: 12); settings.addArrangedSubview(auto); stack.addArrangedSubview(settings); fullWidth(settings)
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor; status.alignment = .center
         stack.addArrangedSubview(status); fullWidth(status)
@@ -304,7 +313,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     }
     @objc func primaryPlayback() { if running { transport(.toggle) } else { start() } }
     @objc func togglePause() { transport(.toggle) }
-    @objc func changeSpeed() { rate = [1, 1.25, 1.5, 2][speed.indexOfSelectedItem]; player?.rate = rate; UserDefaults.standard.set(speed.indexOfSelectedItem, forKey: "speedIndex"); updateNowPlaying() }
+    @objc func changeSpeed() { rate = playbackRates[speed.indexOfSelectedItem]; player?.rate = rate; UserDefaults.standard.set(rate, forKey: "playbackRate"); updateNowPlaying() }
     func configureMediaControls() {
         let center = MPRemoteCommandCenter.shared()
         func register(_ command: MPRemoteCommand, available: @escaping (Reader) -> Bool = { $0.running }, action: @escaping (Reader) -> Void) {
@@ -438,6 +447,15 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 if CommandLine.arguments.contains("--self-test") {
+    for (index, expected) in [Float(1), 1.25, 1.5, 2].enumerated() {
+        assert(restoredPlaybackRate(savedRate: nil, legacyIndex: index) == expected)
+    }
+    for slowRate: Float in [0.75, 0.85] {
+        assert(restoredPlaybackRate(savedRate: slowRate, legacyIndex: 3) == slowRate)
+    }
+    assert(restoredPlaybackRate(savedRate: nil, legacyIndex: 0) == 1)
+    assert(restoredPlaybackRate(savedRate: 99, legacyIndex: 0) == 1)
+    print("PASS: saved slower speeds, legacy speed migration, and default speed")
     let source = String(repeating: "This is a sentence with several words. ", count: 100)
     let pieces = segments(source)
     assert(pieces.count > 2 && pieces[0].count <= 280 && pieces.dropFirst().allSatisfy { $0.count <= 900 })

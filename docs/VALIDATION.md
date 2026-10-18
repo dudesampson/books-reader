@@ -12,6 +12,7 @@ The build script runs the executable with `--self-test` before packaging. Tests 
 - Seeking across prepared audio segments and clamping at their boundaries.
 - Forward/back 15-second seeking.
 - Idempotent play/pause commands and toggle behavior.
+- Restoring 0.75×/0.85× speeds and migrating the original four saved speed choices without changing their values.
 
 These tests do not require Accessibility permission and do not verify Apple Books UI automation or physical headset routing.
 

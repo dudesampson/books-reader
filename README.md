@@ -10,7 +10,7 @@ Built to make assigned reading easier to listen to. This is an experimental pers
 
 - Local speech using the macOS `say` command; no API key or cloud speech service.
 - Pause/resume, a seek bar, and backward/forward skips of 15, 30, or 60 seconds.
-- Playback speeds of 1×, 1.25×, 1.5×, and 2×.
+- Playback speeds of 0.75×, 0.85×, 1×, 1.25×, 1.5×, and 2×.
 - Previous/next page buttons and optional automatic page turns.
 - macOS Now Playing integration for media keys and AirPods controls.
 - A resizable, compact player that stays above normal windows and appears in Mission Control.
