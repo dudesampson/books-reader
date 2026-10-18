@@ -4,6 +4,8 @@ A small macOS companion that reads the visible page in Apple Books aloud, with p
 
 Built to make assigned reading easier to listen to. This is an experimental personal project, developed with AI assistance. It is not affiliated with Apple and does not run on iPhone or iPad.
 
+<img src="docs/images/books-reader.png" alt="Books Reader on macOS showing playback, rewind, speed, and page navigation controls" width="440">
+
 ## Features
 
 - Local speech using the macOS `say` command; no API key or cloud speech service.

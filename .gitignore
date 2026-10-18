@@ -12,6 +12,9 @@
 !/Source/build.command
 /docs/*
 !/docs/VALIDATION.md
+!/docs/images/
+/docs/images/*
+!/docs/images/books-reader.png
 
 # Local artifacts must stay private, even if placed inside an allowed folder.
 .DS_Store
