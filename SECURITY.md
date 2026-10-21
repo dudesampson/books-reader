@@ -1,6 +1,6 @@
 # Security and privacy
 
-Books Reader is an experimental, unsandboxed macOS application. Its source uses Accessibility to read Apple Books and turn pages, and the local `/usr/bin/say` command to generate speech. There are no third-party runtime dependencies or application network calls.
+Books Reader is an experimental, unsandboxed macOS application. Its source uses Accessibility to read Apple Books and turn pages, PDFKit to read user-selected local PDFs without modifying them, and the local `/usr/bin/say` command to generate speech. There are no third-party runtime dependencies or application network calls.
 
 ## Local data
 

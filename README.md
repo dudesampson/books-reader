@@ -1,6 +1,6 @@
 # Books Reader
 
-A small macOS companion that reads the visible page in Apple Books aloud, with playback controls and automatic page turns.
+A small macOS companion that reads Apple Books and local PDFs aloud, with playback controls and automatic page turns.
 
 Built to make assigned reading easier to listen to. This is an experimental personal project, developed with AI assistance. It is not affiliated with Apple and does not run on iPhone or iPad.
 
@@ -12,6 +12,7 @@ Built to make assigned reading easier to listen to. This is an experimental pers
 - Pause/resume, a seek bar, and backward/forward skips of 15, 30, or 60 seconds.
 - Playback speeds of 0.75×, 0.85×, 1×, 1.25×, 1.5×, and 2×.
 - Previous/next page buttons and optional automatic page turns.
+- Built-in PDF viewer with passage highlighting and automatic scrolling.
 - macOS Now Playing integration for media keys and AirPods controls.
 - A resizable, compact player that stays above normal windows and appears in Mission Control.
 
@@ -28,26 +29,34 @@ cd books-reader
 The script compiles the source, runs its self-tests, and creates `dist/Books Reader.app`. It does not download dependencies. You can also double-click `Source/build.command` in Finder.
 
 1. Move the generated app to a stable location, such as your Applications folder, then open it.
-2. In **System Settings → Privacy & Security → Accessibility**, add and enable **Books Reader**.
-3. Open a readable page in Apple Books, then click **Read Page**.
+2. For **Apple Books mode**, add and enable **Books Reader** in **System Settings → Privacy & Security → Accessibility**. PDF mode does not require this permission.
+3. Open a readable page in Apple Books, or click **Open PDF…** and choose a local PDF, then click **Read Page**.
 
 The app is not Developer ID signed or notarized. Rebuilding or moving it may require removing and re-adding its Accessibility entry. Keep one installed copy to avoid confusing different builds. A build from this repository has bundle identifier `io.github.dudesampson.booksreader`; early personal builds used a different identifier.
+
+## Reading PDFs
+
+Click **Open PDF…** (Command-O) and choose your document. A separate PDF window opens; click **Read Page** in the player to start. The source selector switches between **Apple Books** and **PDF**.
+
+The PDF viewer highlights each spoken passage and scrolls to it. With **Automatically turn pages** enabled, narration continues to the next page after finishing the current one. Previous/Next Page and all playback speeds/skips work in PDF mode. Highlighting follows short passages, not individual words, and does not alter or save annotations to your PDF.
+
+Scroll to another PDF page and click **Read visible page** to start there. Pages with no extractable text are skipped during automatic and button-driven navigation. Image-only PDFs need OCR first; OCR is not included. Locked documents and documents that deny both copying and accessibility extraction are not opened for narration. Complex columns, headers, footnotes, and non-English text depend on the PDF text layer and selected system voice.
 
 ## Controls
 
 | Control | Action |
 | --- | --- |
 | Center button / Space | Read the visible page when stopped; pause or resume when reading |
-| Stop / Escape | Stop playback and cancel audio preparation |
+| Stop | Stop playback and cancel audio preparation |
 | Back/forward 15, 30, 60 seconds | Seek within prepared audio on the current page |
 | Timeline | Seek within the prepared portion of the current page |
-| Previous Page / Next Page | Turn the page in Apple Books and start reading it |
-| Read visible page | Restart the page currently visible in Apple Books |
+| Previous Page / Next Page | Turn the page in the selected source and start reading it |
+| Read visible page | Restart the visible page in the selected source |
 | Automatically turn pages | Continue after the current page finishes |
 
-Keyboard shortcuts apply while Books Reader is active. Time skips use audio time: at 2×, 30 seconds of audio plays in 15 seconds. Skips cannot cross page boundaries or reach audio that is still being prepared. A `+` beside the duration means more audio is being generated.
+The Space shortcut applies while the player window is active; Command-O also works from the PDF window. Use the Window menu to switch between the player and PDF. Time skips use audio time: at 2×, 30 seconds of audio plays in 15 seconds. Skips cannot cross page boundaries or reach audio that is still being prepared. A `+` beside the duration means more audio is being generated.
 
-The opening passage is generated first so playback can begin while the rest is prepared. There is still a preparation gap at page boundaries. Pause retains your position for the current session; Stop starts over on the next Read Page. Closing the window quits the app.
+The opening passage is generated first so playback can begin while the rest is prepared. There is still a preparation gap at page boundaries. Pause retains your position for the current session; Stop starts over on the next Read Page. Closing the player window quits the app. Closing the PDF window stops PDF narration; selecting PDF again reopens it.
 
 Drag an edge or corner to resize. Controls become smaller in a compact window, and the app remembers its window frame and selected speed.
 
@@ -61,7 +70,7 @@ macOS chooses which app receives media commands. A browser video or another play
 
 Reading and speech generation happen locally. The application contains no analytics, account login, API keys, or network requests.
 
-Accessibility is a powerful macOS permission. This app uses it to read text exposed by Apple Books and turn pages with targeted left/right key events. Automatic page turns bring Apple Books to the foreground. Only grant the permission to a build you trust.
+PDF mode reads the selected local file using PDFKit and does not need Accessibility access. Apple Books mode needs Accessibility, a powerful macOS permission. This app uses it to read text exposed by Apple Books and turn pages with targeted left/right key events. Automatic page turns bring Apple Books to the foreground. Only grant the permission to a build you trust.
 
 Page text and generated audio are temporarily written under the macOS temporary directory in a uniquely named `BooksReader-*` folder. These files are removed on Stop, page change, and normal quit. A crash or forced quit can leave files behind; this is ordinary deletion, not secure erasure. Book titles and page labels are shared with **macOS Now Playing**, where system media controls can display them.
 
@@ -81,7 +90,7 @@ This is an experimental reading companion, not a service for creating or distrib
 
 ## Limitations
 
-The reader uses the text Apple Books exposes through Accessibility. Image-only pages, some PDFs, and some book layouts may not work. It does not extract protected book files or bypass DRM. A visible two-page spread is treated as one reading unit.
+In Apple Books mode, the reader uses the text Apple Books exposes through Accessibility. Image-only pages, some PDFs, and some book layouts may not work. It does not extract protected book files or bypass DRM. A visible two-page spread is treated as one reading unit.
 
 Keep the intended book window open; if several readable book windows are open, the app may select another one. Reading a single open book is recommended. If you manually change pages while listening, use Read visible page to synchronize again.
 

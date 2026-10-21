@@ -2,6 +2,9 @@ import Cocoa
 import AVFoundation
 import ApplicationServices
 import MediaPlayer
+import PDFKit
+import CoreText
+import UniformTypeIdentifiers
 
 let playbackRates: [Float] = [0.75, 0.85, 1, 1.25, 1.5, 2]
 func restoredPlaybackRate(savedRate: Float?, legacyIndex: Int) -> Float {
@@ -11,7 +14,7 @@ func restoredPlaybackRate(savedRate: Float?, legacyIndex: Int) -> Float {
 }
 
 // Short first segment starts playback quickly; remaining segments are generated ahead.
-func segments(_ text: String) -> [String] {
+func segments(_ text: String, maximumLength: Int? = nil) -> [String] {
     let sentences = text.components(separatedBy: .newlines).flatMap { paragraph -> [String] in
         var result: [String] = []
         paragraph.enumerateSubstrings(in: paragraph.startIndex..<paragraph.endIndex, options: .bySentences) { s, _, _, _ in
@@ -22,7 +25,7 @@ func segments(_ text: String) -> [String] {
     var result: [String] = [], chunk = ""
     for sentence in sentences {
         for word in sentence.split(whereSeparator: { $0.isWhitespace }) {
-            let limit = result.isEmpty ? 280 : 900
+            let limit = maximumLength ?? (result.isEmpty ? 280 : 900)
             if !chunk.isEmpty && chunk.count + word.count + 1 > limit { result.append(chunk); chunk = "" }
             chunk += (chunk.isEmpty ? "" : " ") + word
         }
@@ -42,7 +45,36 @@ enum TransportAction { case play, pause, toggle }
 func pauseState(for action: TransportAction, currentlyPaused: Bool) -> Bool {
     switch action { case .play: return false; case .pause: return true; case .toggle: return !currentlyPaused }
 }
-struct Page { let window: AXUIElement; let title: String; let text: String; let label: String }
+struct Page {
+    let window: AXUIElement?
+    let title: String
+    let text: String
+    let label: String
+    var pdfIndex: Int? = nil
+}
+
+// Keep source ranges so following speech never writes annotations into the PDF.
+func passageRanges(_ text: String, passages: [String]) -> [NSRange] {
+    let matches = text.split(whereSeparator: { $0.isWhitespace }).map { NSRange($0.startIndex..<$0.endIndex, in: text) }
+    var cursor = 0
+    return passages.map { passage in
+        let count = passage.split(whereSeparator: { $0.isWhitespace }).count
+        guard count > 0, cursor + count <= matches.count else { return NSRange(location: NSNotFound, length: 0) }
+        let first = matches[cursor].location
+        let end = NSMaxRange(matches[cursor + count - 1])
+        cursor += count
+        return NSRange(location: first, length: end - first)
+    }
+}
+func readablePDFPage(_ document: PDFDocument, from start: Int, step: Int) -> Int? {
+    guard step == 1 || step == -1 else { return nil }
+    var index = start
+    while index >= 0 && index < document.pageCount {
+        if let text = document.page(at: index)?.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return index }
+        index += step
+    }
+    return nil
+}
 struct AudioPart { let url: URL; let duration: Double }
 
 // Accessible native buttons with a clear, circular transport hierarchy.
@@ -105,15 +137,86 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     var timer: Timer?
     var updateDensity: (() -> Void)?
     var remoteTargets: [(MPRemoteCommand, Any)] = []
+    let sourcePicker = NSPopUpButton()
+    let pdfView = PDFView()
+    var pdfWindow: NSWindow?
+    var pdfDocument: PDFDocument?
+    var pdfTitle = "PDF"
+    var pendingPDFURL: URL?
+    var pdfRanges: [NSRange] = []
+    var readingPDF: Bool { sourcePicker.indexOfSelectedItem == 1 }
+    func samePage(_ a: Page, _ b: Page) -> Bool { a.title == b.title && a.text == b.text && a.pdfIndex == b.pdfIndex }
+
+    @objc func choosePDF() {
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.pdf]; panel.allowsMultipleSelection = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.openPDF(url)
+        }
+    }
+    func openPDF(_ url: URL) {
+        guard let document = PDFDocument(url: url), document.pageCount > 0 else { status.stringValue = "Could not open this PDF."; return }
+        guard !document.isLocked else { status.stringValue = "This PDF is locked. Open an unlocked copy to read it."; return }
+        guard document.allowsCopying || document.allowsContentAccessibility else { status.stringValue = "This PDF does not permit text extraction for reading."; return }
+        guard let first = readablePDFPage(document, from: 0, step: 1) else { status.stringValue = "This PDF has no readable text layer. It needs OCR before narration."; return }
+        stop(); pdfDocument = document; pdfTitle = url.deletingPathExtension().lastPathComponent
+        sourcePicker.selectItem(at: 1)
+        if pdfWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false; w.delegate = self; w.center(); w.contentView = pdfView
+            pdfWindow = w
+            pdfView.autoScales = true; pdfView.displayMode = .singlePageContinuous; pdfView.displayDirection = .vertical
+        }
+        pdfWindow?.title = pdfTitle; pdfView.document = document
+        pdfView.go(to: document.page(at: first)!); pdfWindow?.makeKeyAndOrderFront(nil)
+        position.stringValue = pdfTitle; pageSubtitle.stringValue = "PDF page \(first + 1) of \(document.pageCount)"
+        status.stringValue = "PDF ready. Click Read Page. Scroll to another page to start there."
+        updateControls()
+    }
+    @objc func changeSource() {
+        stop()
+        if readingPDF {
+            if pdfDocument == nil { choosePDF() }
+            else { pdfWindow?.makeKeyAndOrderFront(nil); status.stringValue = "PDF selected. Click Read Page." }
+        } else {
+            pdfWindow?.orderOut(nil); position.stringValue = "Apple Books"; pageSubtitle.stringValue = "Current book"
+            status.stringValue = "Open your book in Apple Books, then click Read Page."
+        }
+    }
+    func followPDFPassage() {
+        guard readingPDF, let pageIndex = page?.pdfIndex, let pdfPage = pdfDocument?.page(at: pageIndex), index < pdfRanges.count else { return }
+        let range = pdfRanges[index]
+        guard range.location != NSNotFound, let selection = pdfPage.selection(for: range) else { return }
+        selection.color = NSColor.systemYellow.withAlphaComponent(0.3)
+        pdfView.highlightedSelections = [selection]
+        pdfView.go(to: selection)
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === window { NSApp.terminate(nil); return false }
+        if sender === pdfWindow { if readingPDF { stop() }; sender.orderOut(nil); return false }
+        return true
+    }
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        if let path = filenames.first {
+            let url = URL(fileURLWithPath: path)
+            if window == nil { pendingPDFURL = url } else { openPDF(url) }
+        }
+        sender.reply(toOpenOrPrint: .success)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu(); let root = NSMenuItem(); menu.addItem(root)
         let items = NSMenu(); items.addItem(withTitle: "Quit Books Reader", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); root.submenu = items; NSApp.mainMenu = menu
+        let fileRoot = NSMenuItem(); fileRoot.title = "File"; menu.addItem(fileRoot)
+        let fileMenu = NSMenu(title: "File"); fileRoot.submenu = fileMenu
+        let openItem = NSMenuItem(title: "Open PDF…", action: #selector(choosePDF), keyEquivalent: "o"); openItem.target = self; fileMenu.addItem(openItem)
+        let windowRoot = NSMenuItem(); windowRoot.title = "Window"; menu.addItem(windowRoot)
+        let windowMenu = NSMenu(title: "Window"); windowRoot.submenu = windowMenu; NSApp.windowsMenu = windowMenu
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 580), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Books Reader"; window.level = .floating; window.center()
         // Floating windows otherwise default to transient and disappear in Mission Control.
         window.collectionBehavior = [.managed, .participatesInCycle]
-        window.contentMinSize = NSSize(width: 420, height: 430)
+        window.contentMinSize = NSSize(width: 420, height: 450)
         window.setFrameAutosaveName("BooksReaderControls")
         let background = NSVisualEffectView(); background.material = .windowBackground; background.blendingMode = .behindWindow; background.state = .active
         window.contentView = background
@@ -131,7 +234,11 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         let icon = NSImageView(); icon.image = symbol("book.closed.fill", size: 30); icon.contentTintColor = .systemOrange
         icon.widthAnchor.constraint(equalToConstant: 52).isActive = true; let iconHeight = icon.heightAnchor.constraint(equalToConstant: 64); iconHeight.isActive = true
         let headings = NSStackView(); headings.orientation = .vertical; headings.alignment = .leading; headings.spacing = 4
-        headings.addArrangedSubview(label("APPLE BOOKS  /  READ ALOUD", size: 10, weight: .semibold))
+        sourcePicker.addItems(withTitles: ["Apple Books", "PDF"]); sourcePicker.target = self; sourcePicker.action = #selector(changeSource)
+        sourcePicker.setAccessibilityLabel("Reading source")
+        let openPDFButton = button("Open PDF…", #selector(choosePDF)); openPDFButton.keyEquivalent = "o"; openPDFButton.keyEquivalentModifierMask = [.command]
+        let sourceRow = NSStackView(views: [sourcePicker, openPDFButton]); sourceRow.spacing = 8
+        headings.addArrangedSubview(sourceRow)
         position.stringValue = "Ready to read"; position.font = .systemFont(ofSize: 23, weight: .semibold); position.lineBreakMode = .byTruncatingTail
         position.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         headings.addArrangedSubview(position)
@@ -169,7 +276,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
 
         let extra = NSStackView(); extra.spacing = 10
         for seconds in [60, 30] { let b = button("−\(seconds)s", #selector(back(_:))); b.tag = seconds; b.toolTip = "Back \(seconds) seconds"; b.setAccessibilityLabel("Back \(seconds) seconds"); seekButtons.append(b); extra.addArrangedSubview(b) }
-        stopButton = button("Stop", #selector(stop)); stopButton.image = symbol("stop.fill", size: 10); stopButton.imagePosition = .imageLeading; stopButton.keyEquivalent = "\u{1b}"; extra.addArrangedSubview(stopButton)
+        stopButton = button("Stop", #selector(stop)); stopButton.image = symbol("stop.fill", size: 10); stopButton.imagePosition = .imageLeading;  extra.addArrangedSubview(stopButton)
         for seconds in [30, 60] { let b = button("+\(seconds)s", #selector(forward(_:))); b.tag = seconds; b.toolTip = "Forward \(seconds) seconds"; b.setAccessibilityLabel("Forward \(seconds) seconds"); seekButtons.append(b); extra.addArrangedSubview(b) }
         stack.addArrangedSubview(extra)
         let secondDivider = NSBox(); secondDivider.boxType = .separator; stack.addArrangedSubview(secondDivider); fullWidth(secondDivider)
@@ -177,7 +284,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         let navigation = NSStackView(); navigation.spacing = 12
         previousButton = button("Previous Page", #selector(previousPage)); previousButton.image = symbol("chevron.left", size: 11); previousButton.imagePosition = .imageLeading
         nextButton = button("Next Page", #selector(nextPage)); nextButton.image = symbol("chevron.right", size: 11); nextButton.imagePosition = .imageTrailing
-        let reread = button("Read visible page", #selector(start)); reread.toolTip = "Start reading the page currently visible in Books from the beginning"
+        let reread = button("Read visible page", #selector(start)); reread.toolTip = "Start reading the visible page in the selected source from the beginning"
         navigation.addArrangedSubview(previousButton); navigation.addArrangedSubview(reread); navigation.addArrangedSubview(nextButton); stack.addArrangedSubview(navigation)
         let settings = NSStackView(); settings.spacing = 10
         settings.addArrangedSubview(label("Speed", size: 12))
@@ -188,7 +295,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         settings.addArrangedSubview(speed); settings.addArrangedSubview(NSView()); auto.state = .on; auto.font = .systemFont(ofSize: 12); settings.addArrangedSubview(auto); stack.addArrangedSubview(settings); fullWidth(settings)
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor; status.alignment = .center
         stack.addArrangedSubview(status); fullWidth(status)
-        let hint = label("Space: play/pause   ·   Esc: stop   ·   Time skips stay on this page", size: 10)
+        let hint = label("Space: play/pause   ·   Time skips stay on this page", size: 10)
         hint.alignment = .center; hint.maximumNumberOfLines = 2; hint.lineBreakMode = .byWordWrapping
         stack.addArrangedSubview(hint); fullWidth(hint)
         var appliedCompact: Bool?
@@ -226,6 +333,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         configureMediaControls()
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.updateTimeline() }
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); updateControls()
+        if let url = pendingPDFURL { pendingPDFURL = nil; openPDF(url) }
     }
     func windowDidResize(_ notification: Notification) { updateDensity?() }
     func button(_ title: String, _ selector: Selector) -> NSButton { NSButton(title: title, target: self, action: selector) }
@@ -244,6 +352,12 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         return ""
     }
     func snapshot() -> Page? {
+        if readingPDF {
+            guard let document = pdfDocument, let current = pdfView.currentPage else { return nil }
+            let index = document.index(for: current)
+            guard index != NSNotFound else { return nil }
+            return Page(window: nil, title: pdfTitle, text: current.string ?? "", label: "PDF page \(index + 1) of \(document.pageCount)", pdfIndex: index)
+        }
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.iBooksX").first else { return nil }
         let root = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(root, 1)
         for w in attr(root, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
@@ -258,13 +372,14 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         return false
     }
     @objc func start() {
-        stop(); guard permitted() else { return }
-        guard let p = snapshot() else { status.stringValue = "Open a readable book page in Apple Books first."; return }
+        stop(); guard readingPDF || permitted() else { return }
+        guard let p = snapshot() else { status.stringValue = readingPDF ? "Open a PDF first." : "Open a readable book page in Apple Books first."; return }
         running = true; begin(p)
     }
     func begin(_ p: Page) {
-        page = p; chunks = segments(p.text); audio = []; index = 0
-        guard !chunks.isEmpty else { fail("This page contains no readable text."); return }
+        page = p; chunks = segments(p.text, maximumLength: p.pdfIndex == nil ? nil : 280); audio = []; index = 0
+        pdfRanges = p.pdfIndex == nil ? [] : passageRanges(p.text, passages: chunks)
+        guard !chunks.isEmpty else { fail("This page contains no readable text. Choose Next Page, or use an OCR copy for scanned pages."); return }
         position.stringValue = p.title
         pageSubtitle.stringValue = p.label.isEmpty ? "Current page" : p.label
         folder = FileManager.default.temporaryDirectory.appendingPathComponent("BooksReader-\(UUID().uuidString)")
@@ -298,6 +413,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         do {
             let p = try AVAudioPlayer(contentsOf: audio[part].url)
             player?.stop(); player = p; index = part; p.delegate = self; p.enableRate = true; p.rate = rate; p.currentTime = offset
+            followPDFPassage()
             if !paused { p.play() }
             status.stringValue = paused ? "Paused. Your position is saved." : "Reading. Remaining audio is prepared in the background."
             updateControls()
@@ -394,22 +510,33 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         token += 1; player?.stop(); player = nil
         let p = job; job = nil; if let p = p, p.isRunning { p.terminate() }
         if let dir = folder { try? FileManager.default.removeItem(at: dir) }; folder = nil
-        audio = []; chunks = []; index = 0
+        audio = []; chunks = []; index = 0; pdfRanges = []; pdfView.highlightedSelections = nil
     }
     @objc func stop() { running = false; paused = false; turning = false; cancelAudio(); status.stringValue = "Stopped. Read Page starts the visible page again."; if pauseButton != nil { updateControls(); updateTimeline() } }
     func fail(_ message: String) { stop(); status.stringValue = message }
     @objc func nextPage() { navigatePage(forward: true) }
     @objc func previousPage() { navigatePage(forward: false) }
     func navigatePage(forward: Bool) {
-        guard !turning, permitted() else { return }
+        guard !turning, readingPDF || permitted() else { return }
         guard let p = snapshot() else { fail("Open a book page first."); return }
         turn(from: p, forward: forward)
     }
     func turn(from p: Page, forward: Bool = true) {
+        if let currentIndex = p.pdfIndex, let document = pdfDocument {
+            let step = forward ? 1 : -1
+            guard let next = readablePDFPage(document, from: currentIndex + step, step: step) else {
+                stop(); status.stringValue = forward ? "PDF finished. No more readable pages." : "You are at the first readable PDF page."; return
+            }
+            cancelAudio(); running = true; paused = false; turning = false
+            let nextPage = document.page(at: next)!
+            pdfView.go(to: nextPage)
+            begin(Page(window: nil, title: pdfTitle, text: nextPage.string ?? "", label: "PDF page \(next + 1) of \(document.pageCount)", pdfIndex: next))
+            return
+        }
         cancelAudio(); running = true; paused = false; turning = true; updateControls(); status.stringValue = forward ? "Turning to next page…" : "Turning to previous page…"
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.iBooksX").first else { fail("Books is no longer open."); return }
         let id = token
-        AXUIElementPerformAction(p.window, kAXRaiseAction as CFString)
+        if let bookWindow = p.window { AXUIElementPerformAction(bookWindow, kAXRaiseAction as CFString) }
         app.activate(options: [])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let s = self, s.running, s.token == id else { return }
@@ -439,14 +566,51 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if index < audio.count { playPart(index) }
         else if index < chunks.count { status.stringValue = paused ? "Paused." : "Preparing the next passage…"; updateNowPlaying() }
         else if auto.state == .on {
-            guard let old = page, let now = snapshot(), now.title == old.title, now.text == old.text else { fail("You changed the page. Click Read Page to read the page now visible."); return }
+            guard let old = page, let now = snapshot(), samePage(now, old) else { fail("You changed the page. Click Read Page to read the page now visible."); return }
             turn(from: old)
         } else { stop(); status.stringValue = "Page finished. Click Next Page to continue." }
     }
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); stop(); for (command, target) in remoteTargets { command.removeTarget(target) }; remoteTargets.removeAll() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
-if CommandLine.arguments.contains("--self-test") {
+func validatePDFText(_ document: PDFDocument) {
+    for index in 0..<document.pageCount {
+        let text = document.page(at: index)?.string ?? ""
+        let chunks = segments(text, maximumLength: 280)
+        let ranges = passageRanges(text, passages: chunks)
+        assert(chunks.joined(separator: " ").split(whereSeparator: { $0.isWhitespace }) == text.split(whereSeparator: { $0.isWhitespace }))
+        for (chunk, range) in zip(chunks, ranges) {
+            assert(range.location != NSNotFound)
+            assert((text as NSString).substring(with: range).split(whereSeparator: { $0.isWhitespace }) == chunk.split(whereSeparator: { $0.isWhitespace }))
+            assert(document.page(at: index)?.selection(for: range) != nil)
+        }
+    }
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--check-pdf"), flag + 1 < CommandLine.arguments.count {
+    guard let document = PDFDocument(url: URL(fileURLWithPath: CommandLine.arguments[flag + 1])), !document.isLocked else { fatalError("Unreadable PDF") }
+    validatePDFText(document)
+    print("PASS: text preservation and speech selection ranges on \(document.pageCount) PDF pages")
+} else if CommandLine.arguments.contains("--self-test") {
+    // In-memory fixture: repeated text, a blank page, and Unicode punctuation.
+    let data = NSMutableData()
+    var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+    let consumer = CGDataConsumer(data: data)!
+    let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil)!
+    for text in ["First page. Café — repeated words.", "", "First page. Café — repeated words."] {
+        context.beginPDFPage(nil)
+        context.textPosition = CGPoint(x: 40, y: 700)
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 16)]))
+        CTLineDraw(line, context); context.endPDFPage()
+    }
+    context.closePDF()
+    let document = PDFDocument(data: data as Data)!
+    validatePDFText(document)
+    assert(readablePDFPage(document, from: 0, step: 1) == 0)
+    assert(readablePDFPage(document, from: 1, step: 1) == 2)
+    assert(readablePDFPage(document, from: 1, step: -1) == 0)
+    assert(readablePDFPage(document, from: 3, step: 1) == nil)
+    assert(readablePDFPage(document, from: -1, step: -1) == nil)
+    print("PASS: PDF speech ranges, repeated pages, blank-page skipping, and document boundaries")
     for (index, expected) in [Float(1), 1.25, 1.5, 2].enumerated() {
         assert(restoredPlaybackRate(savedRate: nil, legacyIndex: index) == expected)
     }
