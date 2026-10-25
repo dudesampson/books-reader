@@ -1,6 +1,8 @@
 # Security and privacy
 
-Books Reader is an experimental, unsandboxed macOS application. Its source uses Accessibility to read Apple Books and turn pages, PDFKit to read user-selected local PDFs without modifying them, and the local `/usr/bin/say` command to generate speech. There are no third-party runtime dependencies or application network calls.
+Books Reader is an experimental, unsandboxed macOS application. Its source uses Accessibility to read Apple Books and loaded Christianbook browser chapters and navigate chapters/pages, PDFKit to read user-selected local PDFs without modifying them, and the local `/usr/bin/say` command to generate speech. There are no third-party runtime dependencies or application network calls.
+
+Christianbook mode recognizes only HTTPS reader URLs on `library.christianbook.com` in supported browsers. It reads the embedded Publica book frame and targets its table-of-contents buttons through Accessibility. It does not access browser cookies, saved passwords, hidden application state, or EPUB download endpoints. Browser requests remain the responsibility of the browser.
 
 ## Local data
 

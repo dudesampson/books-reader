@@ -8,6 +8,7 @@ Developed on Apple silicon with macOS 26. Repository packaging uses Apple Swift 
 
 The build script runs the executable with `--self-test` before packaging. Tests cover:
 
+- Christianbook URL matching, chapter-title whitespace normalization, and chapter-navigation boundaries.
 - Text segmentation, empty input, segment lengths, and word preservation.
 - Seeking across prepared audio segments and clamping at their boundaries.
 - Forward/back 15-second seeking.
@@ -15,7 +16,7 @@ The build script runs the executable with `--self-test` before packaging. Tests 
 - PDF passage-to-source ranges, Unicode text preservation, repeated page text, blank-page skipping, and document boundaries, using a generated in-memory PDF.
 - Restoring 0.75×/0.85× speeds and migrating the original four saved speed choices without changing their values.
 
-These tests do not require Accessibility permission and do not verify Apple Books UI automation or physical headset routing.
+These tests do not require Accessibility permission and do not verify live browser/Apple Books UI automation or physical headset routing.
 
 ## Manual checks during development
 
@@ -31,3 +32,16 @@ These tests do not require Accessibility permission and do not verify Apple Book
 ## Remaining coverage
 
 Physical AirPods commands, Apple Books previous-page navigation, and behavior across additional books and PDF layouts need broader end-to-end testing. Existing media routing depends on which app macOS selects as the active player. There is no claim of compatibility with every Apple Books format or sample.
+
+## Christianbook compatibility
+
+The adapter targets the Christianbook embedded Publica reader. It reads complete loaded chapters, avoiding unreliable Accessibility substring bounds across CSS page columns. Chapter navigation selects adjacent entries in the reader's table of contents. Automated tests cover URL matching, chapter-title normalization, and chapter-navigation bounds. Browser engine variations, reader layout changes, image-only chapters, and non-Christianbook readers require separate verification.
+
+Live checks on 2026-10-25 used the signed-in Christianbook/Publica edition of *The Soulwinner* in Brave:
+
+- Chapter 1 narration started through the new Christianbook source.
+- Next Chapter selected Chapter 2 through the site's table of contents; Previous Chapter returned to Chapter 1 with the contents menu initially closed.
+- Pause and backward 15-second seeking worked, leaving playback paused at 0:00 in Chapter 1.
+- With Continue to next chapter enabled, seeking to the end of the prepared Preface audio triggered the real audio-completion callback, selected Chapter 1, and began preparing its narration.
+- The image-only title section reported no readable chapter instead of narrating unrelated browser controls.
+- The installed UI was visually checked at its compact window size. Safari, Chrome, Edge, other books, and end-of-book live behavior remain unverified.

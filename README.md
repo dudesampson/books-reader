@@ -1,6 +1,6 @@
 # Books Reader
 
-A small macOS companion that reads Apple Books and local PDFs aloud, with playback controls and automatic page turns.
+A small macOS companion that reads Apple Books, local PDFs, and Christianbook browser pages aloud, with playback controls and automatic page turns.
 
 Built to make assigned reading easier to listen to. This is an experimental personal project, developed with AI assistance. It is not affiliated with Apple and does not run on iPhone or iPad.
 
@@ -13,6 +13,7 @@ Built to make assigned reading easier to listen to. This is an experimental pers
 - Playback speeds of 0.75×, 0.85×, 1×, 1.25×, 1.5×, and 2×.
 - Previous/next page buttons and optional automatic page turns.
 - Built-in PDF viewer with passage highlighting and automatic scrolling.
+- Christianbook web reader support through your signed-in browser, with chapter narration and chapter navigation.
 - macOS Now Playing integration for media keys and AirPods controls.
 - A resizable, compact player that stays above normal windows and appears in Mission Control.
 
@@ -29,18 +30,28 @@ cd books-reader
 The script compiles the source, runs its self-tests, and creates `dist/Books Reader.app`. It does not download dependencies. You can also double-click `Source/build.command` in Finder.
 
 1. Move the generated app to a stable location, such as your Applications folder, then open it.
-2. For **Apple Books mode**, add and enable **Books Reader** in **System Settings → Privacy & Security → Accessibility**. PDF mode does not require this permission.
+2. For **Apple Books or Christianbook mode**, add and enable **Books Reader** in **System Settings → Privacy & Security → Accessibility**. PDF mode does not require this permission.
 3. Open a readable page in Apple Books, or click **Open PDF…** and choose a local PDF, then click **Read Page**.
 
 The app is not Developer ID signed or notarized. Rebuilding or moving it may require removing and re-adding its Accessibility entry. Keep one installed copy to avoid confusing different builds. A build from this repository has bundle identifier `io.github.dudesampson.booksreader`; early personal builds used a different identifier.
 
 ## Reading PDFs
 
-Click **Open PDF…** (Command-O) and choose your document. A separate PDF window opens; click **Read Page** in the player to start. The source selector switches between **Apple Books** and **PDF**.
+Click **Open PDF…** (Command-O) and choose your document. A separate PDF window opens; click **Read Page** in the player to start. The source selector switches between **Apple Books**, **PDF**, and **Christianbook**.
 
 The PDF viewer highlights each spoken passage and scrolls to it. With **Automatically turn pages** enabled, narration continues to the next page after finishing the current one. Previous/Next Page and all playback speeds/skips work in PDF mode. Highlighting follows short passages, not individual words, and does not alter or save annotations to your PDF.
 
 Scroll to another PDF page and click **Read visible page** to start there. Pages with no extractable text are skipped during automatic and button-driven navigation. Image-only PDFs need OCR first; OCR is not included. Locked documents and documents that deny both copying and accessibility extraction are not opened for narration. Complex columns, headers, footnotes, and non-English text depend on the PDF text layer and selected system voice.
+
+## Reading Christianbook books
+
+Open your book at `https://library.christianbook.com/reader/…` in Brave, Chrome, Edge, or Safari and sign in normally if required. In Books Reader, choose **Christianbook** from the reading source selector, then click **Read Chapter**. Keep the book tab selected and its window on screen. No URL import, browser extension, JavaScript automation setting, or additional account login in Books Reader is needed.
+
+Christianbook mode reads the **entire loaded chapter from its beginning**, including when the browser is showing a page partway through that chapter. This reader exposes chapter text through macOS Accessibility, while browser text positions across page columns are unreliable. Narration therefore follows chapters rather than the site's displayed pages. There is no passage highlighting or synchronized page scrolling in this mode.
+
+**Previous Chapter**, **Next Chapter**, and **Continue to next chapter** use the site's table of contents. Front matter is treated as a chapter/section too. All existing playback speeds, pause/resume, and time skips apply; skips stay within prepared audio for the current chapter. When continuous reading is enabled, narration moves to the next chapter after the current chapter finishes.
+
+Use one selected Christianbook reader tab at a time. Selecting a different tab or chapter during playback can interrupt automatic continuation; click **Read current chapter** to synchronize. Navigation requires chapter names that match the site's table of contents. Image-only or textless sections cannot be narrated; select a readable section in the browser to continue. The app does not download EPUB files or bypass account access or content protection. Compatibility depends on the current Christianbook/Publica reader layout; other online readers are not supported by this mode. Live testing has covered Brave; the other listed browsers need separate verification.
 
 ## Controls
 
@@ -54,7 +65,7 @@ Scroll to another PDF page and click **Read visible page** to start there. Pages
 | Read visible page | Restart the visible page in the selected source |
 | Automatically turn pages | Continue after the current page finishes |
 
-The Space shortcut applies while the player window is active; Command-O also works from the PDF window. Use the Window menu to switch between the player and PDF. Time skips use audio time: at 2×, 30 seconds of audio plays in 15 seconds. Skips cannot cross page boundaries or reach audio that is still being prepared. A `+` beside the duration means more audio is being generated.
+The Space shortcut applies while the player window is active; Command-O also works from the PDF window. Use the Window menu to switch between the player and PDF. Christianbook uses chapter controls in the selected browser tab. Time skips use audio time: at 2×, 30 seconds of audio plays in 15 seconds. Skips cannot cross page boundaries or reach audio that is still being prepared. A `+` beside the duration means more audio is being generated.
 
 The opening passage is generated first so playback can begin while the rest is prepared. There is still a preparation gap at page boundaries. Pause retains your position for the current session; Stop starts over on the next Read Page. Closing the player window quits the app. Closing the PDF window stops PDF narration; selecting PDF again reopens it.
 
@@ -62,15 +73,15 @@ Drag an edge or corner to resize. Controls become smaller in a compact window, a
 
 ## AirPods and media keys
 
-Starting playback registers the reader with macOS Now Playing. It handles play, pause, toggle, and stop commands. Next/previous track commands are mapped to forward/back 15 seconds within the current page; the physical gesture depends on your headphones.
+Starting playback registers the reader with macOS Now Playing. It handles play, pause, toggle, and stop commands. Next/previous track commands are mapped to forward/back 15 seconds within the current page or Christianbook chapter; the physical gesture depends on your headphones.
 
 macOS chooses which app receives media commands. A browser video or another player can take over. Pause the other media, then use the reader's playback button to resume its session. Physical headset routing still needs broader testing.
 
 ## Privacy and permissions
 
-Reading and speech generation happen locally. The application contains no analytics, account login, API keys, or network requests.
+Reading and speech generation happen locally. The application contains no analytics, account login, API keys, or network requests. In Christianbook mode, your browser continues to handle the website and its account session.
 
-PDF mode reads the selected local file using PDFKit and does not need Accessibility access. Apple Books mode needs Accessibility, a powerful macOS permission. This app uses it to read text exposed by Apple Books and turn pages with targeted left/right key events. Automatic page turns bring Apple Books to the foreground. Only grant the permission to a build you trust.
+PDF mode reads the selected local file using PDFKit and does not need Accessibility access. Apple Books and Christianbook modes need Accessibility, a powerful macOS permission. This app uses it to read text exposed by Apple Books or the supported browser’s loaded book chapter. Apple Books turns pages with targeted left/right key events and brings Books to the foreground; Christianbook selects chapters using the embedded reader’s Accessibility buttons. Only grant the permission to a build you trust.
 
 Page text and generated audio are temporarily written under the macOS temporary directory in a uniquely named `BooksReader-*` folder. These files are removed on Stop, page change, and normal quit. A crash or forced quit can leave files behind; this is ordinary deletion, not secure erasure. Book titles and page labels are shared with **macOS Now Playing**, where system media controls can display them.
 

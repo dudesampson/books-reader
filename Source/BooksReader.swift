@@ -45,12 +45,122 @@ enum TransportAction { case play, pause, toggle }
 func pauseState(for action: TransportAction, currentlyPaused: Bool) -> Bool {
     switch action { case .play: return false; case .pause: return true; case .toggle: return !currentlyPaused }
 }
+// Christianbook exposes EPUB chapters through Accessibility. Chapter-based reading
+// avoids Chromium's unreliable substring geometry across CSS page columns.
+func christianbookURL(_ value: String) -> URL? {
+    guard let url = URL(string: value), url.scheme == "https",
+          url.host?.lowercased() == "library.christianbook.com",
+          url.path.hasPrefix("/reader/"), url.path.count > "/reader/".count else { return nil }
+    return url
+}
+func chapterKey(_ title: String) -> String { title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ") }
+func adjacentChapterIndex(current: Int, count: Int, forward: Bool) -> Int? {
+    guard current >= 0, current < count else { return nil }
+    let next = current + (forward ? 1 : -1)
+    return next >= 0 && next < count ? next : nil
+}
+struct ChristianbookPage {
+    let processID: pid_t
+    let window: AXUIElement
+    let url: URL
+    let readerArea: AXUIElement
+    let chapter: String
+    let chapterID: String
+    var bookID: String { url.host! + url.path }
+}
+enum ChristianbookAccess {
+    static let browsers = ["com.brave.Browser", "com.google.Chrome", "com.microsoft.edgemac", "com.apple.Safari"]
+    static func attr(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, key as CFString, &value)
+        return value
+    }
+    static func children(_ element: AXUIElement) -> [AXUIElement] { attr(element, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+    static func string(_ element: AXUIElement, _ key: String) -> String { attr(element, key) as? String ?? "" }
+    static func name(_ element: AXUIElement) -> String {
+        let title = string(element, kAXTitleAttribute)
+        return title.isEmpty ? string(element, kAXDescriptionAttribute) : title
+    }
+    static func url(_ element: AXUIElement) -> String {
+        if let url = attr(element, "AXURL") as? URL { return url.absoluteString }
+        return string(element, "AXURL")
+    }
+    static func rect(_ element: AXUIElement) -> CGRect? {
+        guard let p = attr(element, kAXPositionAttribute), CFGetTypeID(p) == AXValueGetTypeID(),
+              let s = attr(element, kAXSizeAttribute), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
+        var point = CGPoint.zero, size = CGSize.zero
+        guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: point, size: size)
+    }
+    // Bound traversal and messaging time to avoid hanging on an unresponsive browser.
+    static func find(_ root: AXUIElement, matching: (AXUIElement) -> Bool) -> [AXUIElement] {
+        var result: [AXUIElement] = [], budget = 4000
+        func visit(_ element: AXUIElement, _ depth: Int) {
+            guard budget > 0, depth < 45 else { return }; budget -= 1
+            if matching(element) { result.append(element); return }
+            for child in children(element) { visit(child, depth + 1) }
+        }
+        visit(root, 0); return result
+    }
+    static func snapshot(target: ChristianbookPage? = nil) -> (Page?, String) {
+        let apps = browsers.flatMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0) }
+        var candidates: [(pid_t, AXUIElement, AXUIElement, URL)] = []
+        for app in apps where target == nil || app.processIdentifier == target?.processID {
+            let root = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(root, 0.25)
+            // Chromium starts publishing rich text ranges when an AX client requests it.
+            AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            for window in attr(root, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
+                if attr(window, kAXMinimizedAttribute) as? Bool == true { continue }
+                if let target = target, !CFEqual(window, target.window) { continue }
+                for area in find(window, matching: { string($0, kAXRoleAttribute) == "AXWebArea" && christianbookURL(url($0)) != nil }) {
+                    if let url = christianbookURL(url(area)) { candidates.append((app.processIdentifier, window, area, url)) }
+                }
+            }
+        }
+        guard candidates.count == 1, let (pid, window, outer, url) = candidates.first else {
+            return (nil, candidates.count > 1 ? "More than one Christianbook reader is visible. Keep one reader tab selected, then try again." : "Select your Christianbook book tab in Brave, Chrome, Edge, or Safari, then click Read Page.")
+        }
+        if let target = target, url.host != target.url.host || url.path != target.url.path { return (nil, "The browser changed books. Click Read Page to select the current book.") }
+        let containers = find(outer, matching: { string($0, kAXIdentifierAttribute) == "ReaderVolpe" || string($0, "AXDOMIdentifier") == "ReaderVolpe" })
+        let container = containers.first ?? outer
+        guard let outerRect = rect(outer) else {
+            return (nil, "The Christianbook reader is still loading. Open the book and try Read Page again.")
+        }
+        let readerAreas = find(container, matching: { string($0, kAXRoleAttribute) == "AXWebArea" && URL(string: Self.url($0))?.host == "volpe.publica.la" })
+        var found: [(AXUIElement, AXUIElement, String, String)] = []
+        for readerArea in readerAreas {
+            guard let readerRect = rect(readerArea) else { continue }
+            let clip = outerRect.intersection(readerRect)
+            let bookAreas = find(readerArea, matching: { string($0, kAXRoleAttribute) == "AXWebArea" && urlStringIsBook(Self.url($0)) })
+            for area in bookAreas {
+                guard let bookRect = rect(area) else { continue }
+                let visible = clip.intersection(bookRect)
+                guard !visible.isNull, visible.width > 30, visible.height > 30 else { continue }
+                let leaves = find(area, matching: { string($0, kAXRoleAttribute) == "AXStaticText" })
+                let text = leaves.map { string($0, kAXValueAttribute) }.filter { !$0.isEmpty }.joined(separator: "\n").replacingOccurrences(of: "\u{00ad}", with: "")
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { found.append((readerArea, area, name(area), text)) }
+            }
+        }
+        guard found.count == 1, let (readerArea, bookArea, chapter, text) = found.first else {
+            return (nil, "No single readable Christianbook chapter is available. Close reader menus, keep the book window on screen, and try again.")
+        }
+        let web = ChristianbookPage(processID: pid, window: window, url: url, readerArea: readerArea, chapter: chapter, chapterID: Self.url(bookArea))
+        let title = name(container)
+        return (Page(window: window, title: title.isEmpty ? string(window, kAXTitleAttribute) : title,
+                     text: text, label: chapter.isEmpty ? "Christianbook · Current chapter" : "Christianbook · " + chapter, web: web), "")
+    }
+
+    static func urlStringIsBook(_ value: String) -> Bool { value.hasPrefix("blob:https://volpe.publica.la/") }
+}
+
 struct Page {
     let window: AXUIElement?
     let title: String
     let text: String
     let label: String
     var pdfIndex: Int? = nil
+    var web: ChristianbookPage? = nil
 }
 
 // Keep source ranges so following speech never writes annotations into the PDF.
@@ -144,8 +254,12 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     var pdfTitle = "PDF"
     var pendingPDFURL: URL?
     var pdfRanges: [NSRange] = []
+    var webTarget: ChristianbookPage?
+    var webError = ""
+    var rereadButton: NSButton!, audioCaption: NSTextField!
+    var readingWeb: Bool { sourcePicker.indexOfSelectedItem == 2 }
     var readingPDF: Bool { sourcePicker.indexOfSelectedItem == 1 }
-    func samePage(_ a: Page, _ b: Page) -> Bool { a.title == b.title && a.text == b.text && a.pdfIndex == b.pdfIndex }
+    func samePage(_ a: Page, _ b: Page) -> Bool { a.title == b.title && a.text == b.text && a.pdfIndex == b.pdfIndex && a.web?.bookID == b.web?.bookID && a.web?.chapterID == b.web?.chapterID }
 
     @objc func choosePDF() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.pdf]; panel.allowsMultipleSelection = false
@@ -178,6 +292,10 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if readingPDF {
             if pdfDocument == nil { choosePDF() }
             else { pdfWindow?.makeKeyAndOrderFront(nil); status.stringValue = "PDF selected. Click Read Page." }
+        } else if readingWeb {
+            pdfWindow?.orderOut(nil); webTarget = nil
+            position.stringValue = "Christianbook"; pageSubtitle.stringValue = "Current browser chapter"
+            status.stringValue = "Select your book tab in Brave, Chrome, Edge, or Safari, then click Read Chapter. Reading starts at the chapter’s beginning. Accessibility is required."
         } else {
             pdfWindow?.orderOut(nil); position.stringValue = "Apple Books"; pageSubtitle.stringValue = "Current book"
             status.stringValue = "Open your book in Apple Books, then click Read Page."
@@ -234,7 +352,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         let icon = NSImageView(); icon.image = symbol("book.closed.fill", size: 30); icon.contentTintColor = .systemOrange
         icon.widthAnchor.constraint(equalToConstant: 52).isActive = true; let iconHeight = icon.heightAnchor.constraint(equalToConstant: 64); iconHeight.isActive = true
         let headings = NSStackView(); headings.orientation = .vertical; headings.alignment = .leading; headings.spacing = 4
-        sourcePicker.addItems(withTitles: ["Apple Books", "PDF"]); sourcePicker.target = self; sourcePicker.action = #selector(changeSource)
+        sourcePicker.addItems(withTitles: ["Apple Books", "PDF", "Christianbook"]); sourcePicker.target = self; sourcePicker.action = #selector(changeSource)
         sourcePicker.setAccessibilityLabel("Reading source")
         let openPDFButton = button("Open PDF…", #selector(choosePDF)); openPDFButton.keyEquivalent = "o"; openPDFButton.keyEquivalentModifierMask = [.command]
         let sourceRow = NSStackView(views: [sourcePicker, openPDFButton]); sourceRow.spacing = 8
@@ -255,7 +373,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         progress.addArrangedSubview(scrub)
         scrub.widthAnchor.constraint(equalTo: progress.widthAnchor).isActive = true
         let timeRow = NSStackView(); timeRow.spacing = 8
-        let timeCaption = label("PAGE AUDIO", size: 10, weight: .semibold)
+        let timeCaption = label("PAGE AUDIO", size: 10, weight: .semibold); audioCaption = timeCaption
         let spacer = NSView(); timeRow.addArrangedSubview(timeCaption); timeRow.addArrangedSubview(spacer)
         time.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium); time.textColor = .secondaryLabelColor; time.setContentHuggingPriority(.required, for: .horizontal); timeRow.addArrangedSubview(time)
         progress.addArrangedSubview(timeRow); timeRow.widthAnchor.constraint(equalTo: progress.widthAnchor).isActive = true
@@ -284,7 +402,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         let navigation = NSStackView(); navigation.spacing = 12
         previousButton = button("Previous Page", #selector(previousPage)); previousButton.image = symbol("chevron.left", size: 11); previousButton.imagePosition = .imageLeading
         nextButton = button("Next Page", #selector(nextPage)); nextButton.image = symbol("chevron.right", size: 11); nextButton.imagePosition = .imageTrailing
-        let reread = button("Read visible page", #selector(start)); reread.toolTip = "Start reading the visible page in the selected source from the beginning"
+        let reread = button("Read visible page", #selector(start)); rereadButton = reread; reread.toolTip = "Start reading the visible page in the selected source from the beginning"
         navigation.addArrangedSubview(previousButton); navigation.addArrangedSubview(reread); navigation.addArrangedSubview(nextButton); stack.addArrangedSubview(navigation)
         let settings = NSStackView(); settings.spacing = 10
         settings.addArrangedSubview(label("Speed", size: 12))
@@ -352,6 +470,11 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         return ""
     }
     func snapshot() -> Page? {
+        if readingWeb {
+            let (result, error) = ChristianbookAccess.snapshot(target: webTarget)
+            webError = error
+            return result
+        }
         if readingPDF {
             guard let document = pdfDocument, let current = pdfView.currentPage else { return nil }
             let index = document.index(for: current)
@@ -372,11 +495,12 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         return false
     }
     @objc func start() {
-        stop(); guard readingPDF || permitted() else { return }
-        guard let p = snapshot() else { status.stringValue = readingPDF ? "Open a PDF first." : "Open a readable book page in Apple Books first."; return }
+        stop(); webTarget = nil; guard readingPDF || permitted() else { return }
+        guard let p = snapshot() else { status.stringValue = readingWeb ? webError : readingPDF ? "Open a PDF first." : "Open a readable book page in Apple Books first."; return }
         running = true; begin(p)
     }
     func begin(_ p: Page) {
+        webTarget = p.web
         page = p; chunks = segments(p.text, maximumLength: p.pdfIndex == nil ? nil : 280); audio = []; index = 0
         pdfRanges = p.pdfIndex == nil ? [] : passageRanges(p.text, passages: chunks)
         guard !chunks.isEmpty else { fail("This page contains no readable text. Choose Next Page, or use an OCR copy for scanned pages."); return }
@@ -497,7 +621,15 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         for b in seekButtons where b.isEnabled != canSeek { b.isEnabled = canSeek; b.needsDisplay = true }
     }
     func updateControls() {
-        let caption = !running ? "Read Page" : (paused ? "Resume" : "Pause")
+        let caption = !running ? (readingWeb ? "Read Chapter" : "Read Page") : (paused ? "Resume" : "Pause")
+        previousButton.title = readingWeb ? "Previous Chapter" : "Previous Page"
+        nextButton.title = readingWeb ? "Next Chapter" : "Next Page"
+        rereadButton.title = readingWeb ? "Read current chapter" : "Read visible page"
+        rereadButton.toolTip = readingWeb ? "Read the loaded Christianbook chapter from its beginning" : "Start reading the visible page from the beginning"
+        audioCaption.stringValue = readingWeb ? "CHAPTER AUDIO" : "PAGE AUDIO"
+        scrub.setAccessibilityLabel(readingWeb ? "Chapter audio position" : "Page audio position")
+        scrub.toolTip = readingWeb ? "Seek within prepared audio for this chapter" : "Seek within prepared audio for this page"
+        auto.title = readingWeb ? "Continue to next chapter" : "Automatically turn pages"
         pauseButton.title = caption; pauseButton.setAccessibilityLabel(caption); pauseButton.toolTip = caption + " (Space)"
         (pauseButton as? PlaybackButton)?.symbolName = running && !paused ? "pause.fill" : "play.fill"
         primaryCaption.stringValue = caption; pauseButton.isEnabled = !turning
@@ -512,16 +644,25 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if let dir = folder { try? FileManager.default.removeItem(at: dir) }; folder = nil
         audio = []; chunks = []; index = 0; pdfRanges = []; pdfView.highlightedSelections = nil
     }
-    @objc func stop() { running = false; paused = false; turning = false; cancelAudio(); status.stringValue = "Stopped. Read Page starts the visible page again."; if pauseButton != nil { updateControls(); updateTimeline() } }
+    @objc func stop() { running = false; paused = false; turning = false; cancelAudio(); status.stringValue = readingWeb ? "Stopped. Read Chapter starts the current chapter again." : "Stopped. Read Page starts the visible page again."; if pauseButton != nil { updateControls(); updateTimeline() } }
     func fail(_ message: String) { stop(); status.stringValue = message }
     @objc func nextPage() { navigatePage(forward: true) }
     @objc func previousPage() { navigatePage(forward: false) }
     func navigatePage(forward: Bool) {
         guard !turning, readingPDF || permitted() else { return }
-        guard let p = snapshot() else { fail("Open a book page first."); return }
+        if readingWeb && !running { webTarget = nil }
+        guard let p = snapshot() else { fail(readingWeb ? webError : "Open a book page first."); return }
         turn(from: p, forward: forward)
     }
     func turn(from p: Page, forward: Bool = true) {
+        if let web = p.web {
+            guard !web.chapter.isEmpty else { fail("This book does not expose a chapter name for navigation. Choose a chapter in the browser, then click Read Chapter."); return }
+            guard let current = snapshot(), samePage(current, p) else { fail("The browser chapter changed. Click Read Chapter to continue."); return }
+            cancelAudio(); running = true; paused = false; turning = true; webTarget = web
+            updateControls(); status.stringValue = forward ? "Opening next chapter…" : "Opening previous chapter…"
+            navigateWebChapter(from: p, forward: forward, generation: token, attempts: 12, requestedContents: false)
+            return
+        }
         if let currentIndex = p.pdfIndex, let document = pdfDocument {
             let step = forward ? 1 : -1
             guard let next = readablePDFPage(document, from: currentIndex + step, step: step) else {
@@ -548,15 +689,44 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
             s.waitForPage(p, generation: id, attempts: 16, candidate: nil)
         }
     }
+    func navigateWebChapter(from page: Page, forward: Bool, generation: Int, attempts: Int, requestedContents: Bool) {
+        guard running, token == generation, let web = page.web else { return }
+        let lists = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXList" })
+        for list in lists {
+            let entries = ChristianbookAccess.find(list, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXButton" })
+            guard let current = entries.firstIndex(where: { chapterKey(ChristianbookAccess.name($0)) == chapterKey(web.chapter) }) else { continue }
+            guard let next = adjacentChapterIndex(current: current, count: entries.count, forward: forward) else {
+                // Selecting the current TOC entry closes the menu without leaving the chapter.
+                AXUIElementPerformAction(entries[current], kAXPressAction as CFString)
+                fail(forward ? "Book finished. No next chapter." : "You are at the first chapter or section."); return
+            }
+            guard AXUIElementPerformAction(entries[next], kAXPressAction as CFString) == .success else { fail("Could not open that chapter. Select it in the browser and click Read Chapter."); return }
+            waitForPage(page, generation: generation, attempts: 32, candidate: nil)
+            return
+        }
+        guard attempts > 0 else { fail("Could not find the chapter in the table of contents. Select a chapter in the browser and click Read Chapter."); return }
+        let buttons = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXButton" })
+        var requested = requestedContents
+        if !requestedContents {
+            if let toc = buttons.first(where: { ChristianbookAccess.name($0) == "Table of contents" }) {
+                requested = AXUIElementPerformAction(toc, kAXPressAction as CFString) == .success
+            } else if let show = buttons.first(where: { ChristianbookAccess.name($0) == "Show controls" }) {
+                AXUIElementPerformAction(show, kAXPressAction as CFString)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.navigateWebChapter(from: page, forward: forward, generation: generation, attempts: attempts - 1, requestedContents: requested)
+        }
+    }
     func waitForPage(_ old: Page, generation: Int, attempts: Int, candidate: String?) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let s = self, s.running, s.token == generation else { return }
-            if let p = s.snapshot(), p.title == old.title, p.text != old.text {
+            if let p = s.snapshot(), p.title == old.title, !s.samePage(p, old) {
                 if candidate == p.text { s.turning = false; s.begin(p); return }
                 if attempts > 0 { s.waitForPage(old, generation: generation, attempts: attempts - 1, candidate: p.text); return }
             }
             if attempts > 0 { s.waitForPage(old, generation: generation, attempts: attempts - 1, candidate: nil) }
-            else { s.fail("No new readable page. This may be the beginning or end of the book or sample.") }
+            else { s.fail(s.readingWeb ? "No new readable chapter. Choose a chapter in the browser and click Read Chapter." : "No new readable page. This may be the beginning or end of the book or sample.") }
         }
     }
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -566,9 +736,9 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if index < audio.count { playPart(index) }
         else if index < chunks.count { status.stringValue = paused ? "Paused." : "Preparing the next passage…"; updateNowPlaying() }
         else if auto.state == .on {
-            guard let old = page, let now = snapshot(), samePage(now, old) else { fail("You changed the page. Click Read Page to read the page now visible."); return }
+            guard let old = page, let now = snapshot(), samePage(now, old) else { fail(readingWeb ? "The browser chapter changed. Click Read Chapter to read the current chapter." : "You changed the page. Click Read Page to read the page now visible."); return }
             turn(from: old)
-        } else { stop(); status.stringValue = "Page finished. Click Next Page to continue." }
+        } else { stop(); status.stringValue = readingWeb ? "Chapter finished. Click Next Chapter to continue." : "Page finished. Click Next Page to continue." }
     }
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); stop(); for (command, target) in remoteTargets { command.removeTarget(target) }; remoteTargets.removeAll() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -591,6 +761,18 @@ if let flag = CommandLine.arguments.firstIndex(of: "--check-pdf"), flag + 1 < Co
     validatePDFText(document)
     print("PASS: text preservation and speech selection ranges on \(document.pageCount) PDF pages")
 } else if CommandLine.arguments.contains("--self-test") {
+    assert(christianbookURL("https://library.christianbook.com/reader/the-soulwinner?location=example") != nil)
+    for value in ["http://library.christianbook.com/reader/book", "https://library.christianbook.com.evil.test/reader/book", "https://example.com/reader/book", "https://library.christianbook.com/reader/", "https://library.christianbook.com/library"] {
+        assert(christianbookURL(value) == nil)
+    }
+    assert(chapterKey("  Chapter\n  1  ") == "Chapter 1")
+    assert(adjacentChapterIndex(current: 1, count: 3, forward: true) == 2)
+    assert(adjacentChapterIndex(current: 1, count: 3, forward: false) == 0)
+    assert(adjacentChapterIndex(current: 2, count: 3, forward: true) == nil)
+    assert(adjacentChapterIndex(current: 0, count: 3, forward: false) == nil)
+    assert(adjacentChapterIndex(current: -1, count: 3, forward: true) == nil)
+    assert(adjacentChapterIndex(current: 0, count: 0, forward: true) == nil)
+    print("PASS: Christianbook URL matching, chapter labels, and first/last chapter navigation")
     // In-memory fixture: repeated text, a blank page, and Unicode punctuation.
     let data = NSMutableData()
     var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
