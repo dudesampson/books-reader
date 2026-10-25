@@ -45,19 +45,28 @@ enum TransportAction { case play, pause, toggle }
 func pauseState(for action: TransportAction, currentlyPaused: Bool) -> Bool {
     switch action { case .play: return false; case .pause: return true; case .toggle: return !currentlyPaused }
 }
-// Christianbook exposes EPUB chapters through Accessibility. Chapter-based reading
-// avoids Chromium's unreliable substring geometry across CSS page columns.
+// Use the embedded book viewport, rather than the surrounding reader chrome,
+// when selecting text from a paginated EPUB chapter.
 func christianbookURL(_ value: String) -> URL? {
     guard let url = URL(string: value), url.scheme == "https",
           url.host?.lowercased() == "library.christianbook.com",
           url.path.hasPrefix("/reader/"), url.path.count > "/reader/".count else { return nil }
     return url
 }
-func chapterKey(_ title: String) -> String { title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ") }
-func adjacentChapterIndex(current: Int, count: Int, forward: Bool) -> Int? {
-    guard current >= 0, current < count else { return nil }
-    let next = current + (forward ? 1 : -1)
-    return next >= 0 && next < count ? next : nil
+func visibleWebText(_ text: String, viewport: CGRect, bounds: (NSRange) -> CGRect?) -> String? {
+    let string = text as NSString
+    let words = try! NSRegularExpression(pattern: #"\S+\s*"#)
+    let ranges = words.matches(in: text, range: NSRange(location: 0, length: string.length)).map { $0.range }
+    var selected = ""
+    for range in ranges {
+        // A paragraph can span columns. Its union bounds cannot tell which words
+        // are visible. Assign each word to the page containing its first glyph.
+        let firstGlyph = string.rangeOfComposedCharacterSequence(at: range.location)
+        guard let rect = bounds(firstGlyph), !rect.isNull, !rect.isInfinite else { return nil }
+        guard !rect.isEmpty, viewport.contains(CGPoint(x: rect.midX, y: rect.midY)) else { continue }
+        selected += string.substring(with: range)
+    }
+    return selected
 }
 struct ChristianbookPage {
     let processID: pid_t
@@ -66,6 +75,10 @@ struct ChristianbookPage {
     let readerArea: AXUIElement
     let chapter: String
     let chapterID: String
+    let viewport: CGRect
+    let location: String
+    let next: AXUIElement?
+    let previous: AXUIElement?
     var bookID: String { url.host! + url.path }
 }
 enum ChristianbookAccess {
@@ -91,6 +104,27 @@ enum ChristianbookAccess {
         var point = CGPoint.zero, size = CGSize.zero
         guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
         return CGRect(origin: point, size: size)
+    }
+    static func rangeBounds(_ element: AXUIElement, _ range: NSRange) -> CGRect? {
+        var range = CFRange(location: range.location, length: range.length), value: CFTypeRef?
+        guard let parameter = AXValueCreate(.cfRange, &range),
+              AXUIElementCopyParameterizedAttributeValue(element, "AXBoundsForRange" as CFString, parameter, &value) == .success,
+              let value = value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var result = CGRect.zero
+        return AXValueGetValue(value as! AXValue, .cgRect, &result) ? result : nil
+    }
+    static func viewport(_ bookArea: AXUIElement, in readerArea: AXUIElement) -> CGRect? {
+        guard var clip = rect(readerArea) else { return nil }
+        var element = bookArea
+        // AXWebArea can report the whole chapter's dimensions. Intersect its
+        // containing viewport as well, which excludes header/footer controls.
+        for _ in 0..<30 {
+            if let frame = rect(element), !frame.isEmpty { clip = clip.intersection(frame) }
+            if CFEqual(element, readerArea) { return clip.isEmpty ? nil : clip }
+            guard let parent = attr(element, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { return nil }
+            element = parent as! AXUIElement
+        }
+        return nil
     }
     // Bound traversal and messaging time to avoid hanging on an unresponsive browser.
     static func find(_ root: AXUIElement, matching: (AXUIElement) -> Bool) -> [AXUIElement] {
@@ -128,27 +162,39 @@ enum ChristianbookAccess {
             return (nil, "The Christianbook reader is still loading. Open the book and try Read Page again.")
         }
         let readerAreas = find(container, matching: { string($0, kAXRoleAttribute) == "AXWebArea" && URL(string: Self.url($0))?.host == "volpe.publica.la" })
-        var found: [(AXUIElement, AXUIElement, String, String)] = []
+        var found: [(AXUIElement, AXUIElement, String, String, CGRect)] = []
         for readerArea in readerAreas {
-            guard let readerRect = rect(readerArea) else { continue }
-            let clip = outerRect.intersection(readerRect)
             let bookAreas = find(readerArea, matching: { string($0, kAXRoleAttribute) == "AXWebArea" && urlStringIsBook(Self.url($0)) })
             for area in bookAreas {
-                guard let bookRect = rect(area) else { continue }
-                let visible = clip.intersection(bookRect)
+                guard let bookClip = viewport(area, in: readerArea) else { continue }
+                let visible = outerRect.intersection(bookClip)
                 guard !visible.isNull, visible.width > 30, visible.height > 30 else { continue }
                 let leaves = find(area, matching: { string($0, kAXRoleAttribute) == "AXStaticText" })
-                let text = leaves.map { string($0, kAXValueAttribute) }.filter { !$0.isEmpty }.joined(separator: "\n").replacingOccurrences(of: "\u{00ad}", with: "")
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { found.append((readerArea, area, name(area), text)) }
+                var selected: [String] = []
+                for leaf in leaves {
+                    let text = string(leaf, kAXValueAttribute)
+                    guard !text.isEmpty else { continue }
+                    if let frame = rect(leaf), !frame.intersects(visible) { continue }
+                    guard let words = visibleWebText(text, viewport: visible, bounds: { rangeBounds(leaf, $0) }) else {
+                        return (nil, "The browser is not exposing word positions. Keep the book tab selected and try again.")
+                    }
+                    if !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { selected.append(words) }
+                }
+                let text = selected.joined(separator: "\n").replacingOccurrences(of: "\u{00ad}", with: "")
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { found.append((readerArea, area, name(area), text, visible)) }
             }
         }
-        guard found.count == 1, let (readerArea, bookArea, chapter, text) = found.first else {
-            return (nil, "No single readable Christianbook chapter is available. Close reader menus, keep the book window on screen, and try again.")
+        guard found.count == 1, let (readerArea, bookArea, chapter, text, visible) = found.first else {
+            return (nil, "No single readable Christianbook page is available. Close reader menus, keep the book window on screen, and try again.")
         }
-        let web = ChristianbookPage(processID: pid, window: window, url: url, readerArea: readerArea, chapter: chapter, chapterID: Self.url(bookArea))
+        let buttons = find(readerArea, matching: { string($0, kAXRoleAttribute) == "AXButton" })
+        func button(_ title: String) -> AXUIElement? { buttons.first { name($0) == title } }
+        let sliders = find(readerArea, matching: { string($0, kAXRoleAttribute) == "AXSlider" && name($0) == "Page navigation" })
+        let location = url.absoluteString + "|" + (sliders.first.map { String(describing: attr($0, kAXValueAttribute)) } ?? "")
+        let web = ChristianbookPage(processID: pid, window: window, url: url, readerArea: readerArea, chapter: chapter, chapterID: Self.url(bookArea), viewport: visible, location: location, next: button("Next"), previous: button("Prev"))
         let title = name(container)
         return (Page(window: window, title: title.isEmpty ? string(window, kAXTitleAttribute) : title,
-                     text: text, label: chapter.isEmpty ? "Christianbook · Current chapter" : "Christianbook · " + chapter, web: web), "")
+                     text: text, label: chapter.isEmpty ? "Christianbook · Visible page" : "Christianbook · " + chapter, web: web), "")
     }
 
     static func urlStringIsBook(_ value: String) -> Bool { value.hasPrefix("blob:https://volpe.publica.la/") }
@@ -259,7 +305,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     var rereadButton: NSButton!, audioCaption: NSTextField!
     var readingWeb: Bool { sourcePicker.indexOfSelectedItem == 2 }
     var readingPDF: Bool { sourcePicker.indexOfSelectedItem == 1 }
-    func samePage(_ a: Page, _ b: Page) -> Bool { a.title == b.title && a.text == b.text && a.pdfIndex == b.pdfIndex && a.web?.bookID == b.web?.bookID && a.web?.chapterID == b.web?.chapterID }
+    func samePage(_ a: Page, _ b: Page) -> Bool { a.title == b.title && a.text == b.text && a.pdfIndex == b.pdfIndex && a.web?.bookID == b.web?.bookID && a.web?.chapterID == b.web?.chapterID && a.web?.location == b.web?.location && a.web?.viewport == b.web?.viewport }
 
     @objc func choosePDF() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.pdf]; panel.allowsMultipleSelection = false
@@ -294,8 +340,8 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
             else { pdfWindow?.makeKeyAndOrderFront(nil); status.stringValue = "PDF selected. Click Read Page." }
         } else if readingWeb {
             pdfWindow?.orderOut(nil); webTarget = nil
-            position.stringValue = "Christianbook"; pageSubtitle.stringValue = "Current browser chapter"
-            status.stringValue = "Select your book tab in Brave, Chrome, Edge, or Safari, then click Read Chapter. Reading starts at the chapter’s beginning. Accessibility is required."
+            position.stringValue = "Christianbook"; pageSubtitle.stringValue = "Current browser page"
+            status.stringValue = "Select your book tab in Brave, Chrome, Edge, or Safari, then click Read Page. Automatically turn pages keeps narration moving through the book. Accessibility is required."
         } else {
             pdfWindow?.orderOut(nil); position.stringValue = "Apple Books"; pageSubtitle.stringValue = "Current book"
             status.stringValue = "Open your book in Apple Books, then click Read Page."
@@ -621,15 +667,12 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         for b in seekButtons where b.isEnabled != canSeek { b.isEnabled = canSeek; b.needsDisplay = true }
     }
     func updateControls() {
-        let caption = !running ? (readingWeb ? "Read Chapter" : "Read Page") : (paused ? "Resume" : "Pause")
-        previousButton.title = readingWeb ? "Previous Chapter" : "Previous Page"
-        nextButton.title = readingWeb ? "Next Chapter" : "Next Page"
-        rereadButton.title = readingWeb ? "Read current chapter" : "Read visible page"
-        rereadButton.toolTip = readingWeb ? "Read the loaded Christianbook chapter from its beginning" : "Start reading the visible page from the beginning"
-        audioCaption.stringValue = readingWeb ? "CHAPTER AUDIO" : "PAGE AUDIO"
-        scrub.setAccessibilityLabel(readingWeb ? "Chapter audio position" : "Page audio position")
-        scrub.toolTip = readingWeb ? "Seek within prepared audio for this chapter" : "Seek within prepared audio for this page"
-        auto.title = readingWeb ? "Continue to next chapter" : "Automatically turn pages"
+        let caption = !running ? "Read Page" : (paused ? "Resume" : "Pause")
+        previousButton.title = "Previous Page"; nextButton.title = "Next Page"
+        rereadButton.title = "Read visible page"; rereadButton.toolTip = "Start reading the visible page from the beginning"
+        audioCaption.stringValue = "PAGE AUDIO"
+        scrub.setAccessibilityLabel("Page audio position"); scrub.toolTip = "Seek within prepared audio for this page"
+        auto.title = "Automatically turn pages"
         pauseButton.title = caption; pauseButton.setAccessibilityLabel(caption); pauseButton.toolTip = caption + " (Space)"
         (pauseButton as? PlaybackButton)?.symbolName = running && !paused ? "pause.fill" : "play.fill"
         primaryCaption.stringValue = caption; pauseButton.isEnabled = !turning
@@ -644,7 +687,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if let dir = folder { try? FileManager.default.removeItem(at: dir) }; folder = nil
         audio = []; chunks = []; index = 0; pdfRanges = []; pdfView.highlightedSelections = nil
     }
-    @objc func stop() { running = false; paused = false; turning = false; cancelAudio(); status.stringValue = readingWeb ? "Stopped. Read Chapter starts the current chapter again." : "Stopped. Read Page starts the visible page again."; if pauseButton != nil { updateControls(); updateTimeline() } }
+    @objc func stop() { running = false; paused = false; turning = false; cancelAudio(); status.stringValue = "Stopped. Read Page starts the visible page again."; if pauseButton != nil { updateControls(); updateTimeline() } }
     func fail(_ message: String) { stop(); status.stringValue = message }
     @objc func nextPage() { navigatePage(forward: true) }
     @objc func previousPage() { navigatePage(forward: false) }
@@ -656,11 +699,17 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
     }
     func turn(from p: Page, forward: Bool = true) {
         if let web = p.web {
-            guard !web.chapter.isEmpty else { fail("This book does not expose a chapter name for navigation. Choose a chapter in the browser, then click Read Chapter."); return }
-            guard let current = snapshot(), samePage(current, p) else { fail("The browser chapter changed. Click Read Chapter to continue."); return }
+            guard let current = snapshot(), samePage(current, p) else { fail("The browser page or layout changed. Click Read Page to continue."); return }
+            guard let button = forward ? web.next : web.previous,
+                  ChristianbookAccess.attr(button, kAXEnabledAttribute) as? Bool != false else {
+                fail("No more pages in this direction, or the reader controls are unavailable."); return
+            }
             cancelAudio(); running = true; paused = false; turning = true; webTarget = web
-            updateControls(); status.stringValue = forward ? "Opening next chapter…" : "Opening previous chapter…"
-            navigateWebChapter(from: p, forward: forward, generation: token, attempts: 12, requestedContents: false)
+            updateControls(); status.stringValue = forward ? "Turning to next page…" : "Turning to previous page…"
+            guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+                fail("Could not turn the Christianbook page. Show the reader controls and try again."); return
+            }
+            waitForPage(p, generation: token, attempts: 32, candidate: nil)
             return
         }
         if let currentIndex = p.pdfIndex, let document = pdfDocument {
@@ -689,35 +738,6 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
             s.waitForPage(p, generation: id, attempts: 16, candidate: nil)
         }
     }
-    func navigateWebChapter(from page: Page, forward: Bool, generation: Int, attempts: Int, requestedContents: Bool) {
-        guard running, token == generation, let web = page.web else { return }
-        let lists = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXList" })
-        for list in lists {
-            let entries = ChristianbookAccess.find(list, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXButton" })
-            guard let current = entries.firstIndex(where: { chapterKey(ChristianbookAccess.name($0)) == chapterKey(web.chapter) }) else { continue }
-            guard let next = adjacentChapterIndex(current: current, count: entries.count, forward: forward) else {
-                // Selecting the current TOC entry closes the menu without leaving the chapter.
-                AXUIElementPerformAction(entries[current], kAXPressAction as CFString)
-                fail(forward ? "Book finished. No next chapter." : "You are at the first chapter or section."); return
-            }
-            guard AXUIElementPerformAction(entries[next], kAXPressAction as CFString) == .success else { fail("Could not open that chapter. Select it in the browser and click Read Chapter."); return }
-            waitForPage(page, generation: generation, attempts: 32, candidate: nil)
-            return
-        }
-        guard attempts > 0 else { fail("Could not find the chapter in the table of contents. Select a chapter in the browser and click Read Chapter."); return }
-        let buttons = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXButton" })
-        var requested = requestedContents
-        if !requestedContents {
-            if let toc = buttons.first(where: { ChristianbookAccess.name($0) == "Table of contents" }) {
-                requested = AXUIElementPerformAction(toc, kAXPressAction as CFString) == .success
-            } else if let show = buttons.first(where: { ChristianbookAccess.name($0) == "Show controls" }) {
-                AXUIElementPerformAction(show, kAXPressAction as CFString)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.navigateWebChapter(from: page, forward: forward, generation: generation, attempts: attempts - 1, requestedContents: requested)
-        }
-    }
     func waitForPage(_ old: Page, generation: Int, attempts: Int, candidate: String?) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let s = self, s.running, s.token == generation else { return }
@@ -726,7 +746,7 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
                 if attempts > 0 { s.waitForPage(old, generation: generation, attempts: attempts - 1, candidate: p.text); return }
             }
             if attempts > 0 { s.waitForPage(old, generation: generation, attempts: attempts - 1, candidate: nil) }
-            else { s.fail(s.readingWeb ? "No new readable chapter. Choose a chapter in the browser and click Read Chapter." : "No new readable page. This may be the beginning or end of the book or sample.") }
+            else { s.fail(s.readingWeb ? "No new readable page. This may be the beginning or end of the book, or an image-only page. Choose a readable page in the browser and click Read Page." : "No new readable page. This may be the beginning or end of the book or sample.") }
         }
     }
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -736,9 +756,9 @@ final class Reader: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate, NSWi
         if index < audio.count { playPart(index) }
         else if index < chunks.count { status.stringValue = paused ? "Paused." : "Preparing the next passage…"; updateNowPlaying() }
         else if auto.state == .on {
-            guard let old = page, let now = snapshot(), samePage(now, old) else { fail(readingWeb ? "The browser chapter changed. Click Read Chapter to read the current chapter." : "You changed the page. Click Read Page to read the page now visible."); return }
+            guard let old = page, let now = snapshot(), samePage(now, old) else { fail(readingWeb ? "The browser page changed. Click Read Page to read the visible page." : "You changed the page. Click Read Page to read the page now visible."); return }
             turn(from: old)
-        } else { stop(); status.stringValue = readingWeb ? "Chapter finished. Click Next Chapter to continue." : "Page finished. Click Next Page to continue." }
+        } else { stop(); status.stringValue = "Page finished. Click Next Page to continue." }
     }
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); stop(); for (command, target) in remoteTargets { command.removeTarget(target) }; remoteTargets.removeAll() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -756,7 +776,55 @@ func validatePDFText(_ document: PDFDocument) {
         }
     }
 }
-if let flag = CommandLine.arguments.firstIndex(of: "--check-pdf"), flag + 1 < CommandLine.arguments.count {
+// Opt-in diagnostics contain geometry and attribute names, never book passages.
+if let flag = CommandLine.arguments.firstIndex(of: "--check-web-geometry"), flag + 1 < CommandLine.arguments.count {
+    let (page, error) = ChristianbookAccess.snapshot()
+    var report: [String: Any] = ["trusted": AXIsProcessTrusted(), "error": error]
+    if let web = page?.web {
+        let areas = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXWebArea" })
+        var rows: [[String: Any]] = []
+        func rectData(_ value: CFTypeRef?) -> String {
+            guard let value = value, CFGetTypeID(value) == AXValueGetTypeID() else { return String(describing: value) }
+            var rect = CGRect.zero
+            return AXValueGetValue(value as! AXValue, .cgRect, &rect) ? NSStringFromRect(rect) : String(describing: value)
+        }
+        for area in areas {
+            rows.append(["role": "area", "rect": ChristianbookAccess.rect(area).map { NSStringFromRect($0) } ?? "nil"])
+            let leaves = ChristianbookAccess.find(area, matching: { ChristianbookAccess.string($0, kAXRoleAttribute) == "AXStaticText" })
+            for (number, leaf) in leaves.prefix(12).enumerated() {
+                let text = ChristianbookAccess.string(leaf, kAXValueAttribute) as NSString
+                var parameters: CFArray?; AXUIElementCopyParameterizedAttributeNames(leaf, &parameters)
+                var row: [String: Any] = ["leaf": number, "length": text.length, "rect": ChristianbookAccess.rect(leaf).map { NSStringFromRect($0) } ?? "nil", "parameters": parameters as? [String] ?? [], "visibleRange": String(describing: ChristianbookAccess.attr(leaf, "AXVisibleCharacterRange"))]
+                var bounds: [[String: Any]] = []
+                for location in [0, text.length / 2, max(0, text.length - 2)] {
+                    var range = CFRange(location: location, length: min(1, text.length))
+                    if let parameter = AXValueCreate(.cfRange, &range) {
+                        var value: CFTypeRef?
+                        let result = AXUIElementCopyParameterizedAttributeValue(leaf, "AXBoundsForRange" as CFString, parameter, &value)
+                        bounds.append(["offset": location, "result": result.rawValue, "bounds": rectData(value)])
+                    }
+                }
+                row["bounds"] = bounds; rows.append(row)
+            }
+        }
+        report["rows"] = rows
+        report["viewport"] = NSStringFromRect(web.viewport)
+        let books = ChristianbookAccess.find(web.readerArea, matching: { ChristianbookAccess.urlStringIsBook(ChristianbookAccess.url($0)) })
+        if let book = books.first {
+            var element = book, ancestors: [[String: String]] = []
+            for _ in 0..<20 {
+                ancestors.append(["role": ChristianbookAccess.string(element, kAXRoleAttribute), "identifier": ChristianbookAccess.string(element, "AXDOMIdentifier"), "rect": ChristianbookAccess.rect(element).map { NSStringFromRect($0) } ?? "nil"])
+                if CFEqual(element, web.readerArea) { break }
+                guard let parent = ChristianbookAccess.attr(element, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+                element = parent as! AXUIElement
+            }
+            report["ancestors"] = ancestors
+        }
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+    }
+} else if let flag = CommandLine.arguments.firstIndex(of: "--check-pdf"), flag + 1 < CommandLine.arguments.count {
     guard let document = PDFDocument(url: URL(fileURLWithPath: CommandLine.arguments[flag + 1])), !document.isLocked else { fatalError("Unreadable PDF") }
     validatePDFText(document)
     print("PASS: text preservation and speech selection ranges on \(document.pageCount) PDF pages")
@@ -765,14 +833,25 @@ if let flag = CommandLine.arguments.firstIndex(of: "--check-pdf"), flag + 1 < Co
     for value in ["http://library.christianbook.com/reader/book", "https://library.christianbook.com.evil.test/reader/book", "https://example.com/reader/book", "https://library.christianbook.com/reader/", "https://library.christianbook.com/library"] {
         assert(christianbookURL(value) == nil)
     }
-    assert(chapterKey("  Chapter\n  1  ") == "Chapter 1")
-    assert(adjacentChapterIndex(current: 1, count: 3, forward: true) == 2)
-    assert(adjacentChapterIndex(current: 1, count: 3, forward: false) == 0)
-    assert(adjacentChapterIndex(current: 2, count: 3, forward: true) == nil)
-    assert(adjacentChapterIndex(current: 0, count: 3, forward: false) == nil)
-    assert(adjacentChapterIndex(current: -1, count: 3, forward: true) == nil)
-    assert(adjacentChapterIndex(current: 0, count: 0, forward: true) == nil)
-    print("PASS: Christianbook URL matching, chapter labels, and first/last chapter navigation")
+    // The header/footer belong to the outer reader, not the book viewport.
+    // A multi-column text node can have union bounds intersecting both pages.
+    let fixture = "Header café 🌍 page one page two footer"
+    let nsFixture = fixture as NSString
+    let words = try! NSRegularExpression(pattern: #"\S+\s*"#).matches(in: fixture, range: NSRange(location: 0, length: nsFixture.length))
+    let boxes = words.enumerated().map { index, word in
+        (word.range, CGRect(x: index >= 5 && index <= 6 ? 120 : 10, y: index == 0 ? 0 : index == 7 ? 110 : 30 + Double(index) * 5, width: 10, height: 10))
+    }
+    func bounds(_ range: NSRange) -> CGRect? { boxes.first { NSIntersectionRange($0.0, range).length > 0 }?.1 }
+    let viewport = CGRect(x: 0, y: 20, width: 100, height: 80)
+    assert(visibleWebText(fixture, viewport: viewport, bounds: bounds)?.trimmingCharacters(in: .whitespacesAndNewlines) == "café 🌍 page one")
+    assert(visibleWebText(fixture, viewport: CGRect(x: 100, y: 20, width: 100, height: 80), bounds: bounds)?.trimmingCharacters(in: .whitespacesAndNewlines) == "page two")
+    let first = visibleWebText(fixture, viewport: viewport, bounds: bounds)!
+    let second = visibleWebText(fixture, viewport: CGRect(x: 100, y: 20, width: 100, height: 80), bounds: bounds)!
+    assert((first + second).split(whereSeparator: { $0.isWhitespace }).map(String.init) == ["café", "🌍", "page", "one", "page", "two"])
+    assert(visibleWebText("", viewport: viewport, bounds: { _ in nil }) == "")
+    assert(visibleWebText("word", viewport: viewport, bounds: { _ in nil }) == nil)
+    assert(visibleWebText("word", viewport: viewport, bounds: { _ in .zero }) == "")
+    print("PASS: Christianbook URL matching, book-viewport clipping, page boundaries, and Unicode preservation")
     // In-memory fixture: repeated text, a blank page, and Unicode punctuation.
     let data = NSMutableData()
     var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
